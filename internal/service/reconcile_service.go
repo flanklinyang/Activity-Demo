@@ -16,12 +16,8 @@ import (
 
 // StartReconcileLoop 启动定时对账：Redis有报名记录但MySQL没有的，补发MQ消息落库
 func StartReconcileLoop() {
-	interval := time.Duration(config.Conf.Reconcile.IntervalSecond) * time.Second
-	if interval <= 0 {
-		interval = time.Minute
-	}
 	go func() {
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(reconcileInterval())
 		defer ticker.Stop()
 		for {
 			if err := Reconcile(context.Background()); err != nil {
@@ -32,14 +28,24 @@ func StartReconcileLoop() {
 	}()
 }
 
+func reconcileInterval() time.Duration {
+	interval := time.Duration(config.Conf.Reconcile.IntervalSecond) * time.Second
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	return interval
+}
+
 // Reconcile 对全部活动执行一次对账
 func Reconcile(ctx context.Context) error {
-	if depth, err := mq.DeadLetterDepth(); err == nil && depth > 0 {
-		log.Printf("警告: 死信队列积压 %d 条消息，需要人工重放\n", depth)
-	}
 	var activities []model.Activity
 	if err := repository.DB.Find(&activities).Error; err != nil {
 		return err
+	}
+	// 近期有消费失败丢弃=DB写入不健康，跳过本轮补发，避免对账补发与消费重试互相放大
+	if dropped, recent := mq.DroppedRecently(2 * reconcileInterval()); recent {
+		log.Printf("近期有%d条消息消费失败被丢弃，跳过本轮补发，等待DB恢复\n", dropped)
+		return nil
 	}
 	for i := range activities {
 		if err := reconcileActivity(ctx, &activities[i]); err != nil {

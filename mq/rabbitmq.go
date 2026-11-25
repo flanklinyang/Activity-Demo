@@ -23,10 +23,8 @@ type SignUpMsg struct {
 
 const (
 	queueName     = "activity_signup_queue"
-	dlxQueueName  = "activity_signup_dlx_queue"
 	exchangeName  = "activity_exchange"
-	dlxExchange   = "activity_dlx_exchange"
-	maxRetryCount = 3 // 最大重试3次，超过进死信队列
+	maxRetryCount = 3 // 最大重试3次，超过直接丢弃，报名事实在Redis，由定时对账补发
 )
 
 const publishPoolSize = 16
@@ -37,6 +35,9 @@ var (
 	// pubPool 发布通道池：每个通道独立串行确认，池化并行发布，避免单通道确认等待串行化
 	pubPool []*pubChannel
 	pubIdx  atomic.Uint64
+	// droppedCount/lastDropAt 重试耗尽被丢弃的消息统计，供对账判断DB写入是否健康
+	droppedCount atomic.Uint64
+	lastDropAt   atomic.Int64
 )
 
 // pubChannel 一个独立发布通道，mu 保证该通道同一时刻只有一个待确认消息
@@ -46,7 +47,7 @@ type pubChannel struct {
 	mu       sync.Mutex
 }
 
-// InitRabbitMQ 初始化连接、交换机、队列、死信配置，并开启生产者确认模式
+// InitRabbitMQ 初始化连接、交换机、队列，并开启生产者确认模式
 func InitRabbitMQ() error {
 	url := fmt.Sprintf("amqp://%s:%s@%s/", config.Conf.RabbitMQ.User, config.Conf.RabbitMQ.Password, config.Conf.RabbitMQ.Addr)
 	var err error
@@ -59,37 +60,18 @@ func InitRabbitMQ() error {
 		return err
 	}
 
-	// 声明死信交换机
-	err = channel.ExchangeDeclare(dlxExchange, "direct", true, false, false, false, nil)
-	if err != nil {
-		return err
-	}
 	// 声明业务交换机
 	err = channel.ExchangeDeclare(exchangeName, "direct", true, false, false, false, nil)
 	if err != nil {
 		return err
 	}
 
-	// 业务队列：绑定死信交换机
-	args := amqp091.Table{
-		"x-dead-letter-exchange":    dlxExchange,
-		"x-dead-letter-routing-key": dlxQueueName,
-	}
-	_, err = channel.QueueDeclare(queueName, true, false, false, false, args)
+	// 业务队列（无死信配置：重试耗尽直接丢弃，由定时对账兜底补发）
+	_, err = channel.QueueDeclare(queueName, true, false, false, false, nil)
 	if err != nil {
 		return err
 	}
 	err = channel.QueueBind(queueName, queueName, exchangeName, false, nil)
-	if err != nil {
-		return err
-	}
-
-	// 死信队列
-	_, err = channel.QueueDeclare(dlxQueueName, true, false, false, false, nil)
-	if err != nil {
-		return err
-	}
-	err = channel.QueueBind(dlxQueueName, dlxQueueName, dlxExchange, false, nil)
 	if err != nil {
 		return err
 	}
@@ -232,8 +214,10 @@ func processDelivery(id int, d amqp091.Delivery, signMsg *SignUpMsg, callback fu
 	}()
 	if err := callback(context.Background(), signMsg); err != nil {
 		if signMsg.RetryCount >= maxRetryCount {
-			// 超过最大重试次数，Nack且不重回队列，由队列死信配置转入死信队列
-			log.Printf("消息超过最大重试次数，进入死信队列, activityId:%d userId:%d err:%v\n", signMsg.ActivityId, signMsg.StudentId, err)
+			// 超过最大重试次数：Nack不重回队列，消息丢弃；报名事实仍在Redis，由定时对账补发
+			droppedCount.Add(1)
+			lastDropAt.Store(time.Now().Unix())
+			log.Printf("消息重试耗尽已丢弃，等待对账补发, activityId:%d userId:%d err:%v\n", signMsg.ActivityId, signMsg.StudentId, err)
 			_ = d.Nack(false, false)
 		} else {
 			// 重试次数+1并重新发布（消息体重发，计数真实递增）
@@ -254,13 +238,10 @@ func processDelivery(id int, d amqp091.Delivery, signMsg *SignUpMsg, callback fu
 	}
 }
 
-// DeadLetterDepth 死信队列积压数量
-func DeadLetterDepth() (int, error) {
-	q, err := channel.QueueDeclarePassive(dlxQueueName, true, false, false, false, nil)
-	if err != nil {
-		return 0, err
-	}
-	return q.Messages, nil
+// DroppedRecently 返回近期重试耗尽被丢弃的消息数和最近一次丢弃是否发生在 since 内
+func DroppedRecently(since time.Duration) (uint64, bool) {
+	t := time.Unix(lastDropAt.Load(), 0)
+	return droppedCount.Load(), time.Since(t) < since
 }
 
 // QueueDepth 业务队列积压数量
@@ -270,33 +251,6 @@ func QueueDepth() (int, error) {
 		return 0, err
 	}
 	return q.Messages, nil
-}
-
-// RequeueDeadLetters 将死信队列的消息重新投递回业务队列（重试计数清零），用于故障恢复后手动重放
-func RequeueDeadLetters(ctx context.Context) (int, error) {
-	n := 0
-	for {
-		d, ok, err := channel.Get(dlxQueueName, false)
-		if err != nil {
-			return n, err
-		}
-		if !ok {
-			return n, nil
-		}
-		var msg SignUpMsg
-		if err := json.Unmarshal(d.Body, &msg); err != nil {
-			_ = d.Ack(false)
-			continue
-		}
-		msg.RetryCount = 0
-		body, _ := json.Marshal(&msg)
-		if err := publishWithConfirm(ctx, body); err != nil {
-			_ = d.Nack(false, true)
-			return n, err
-		}
-		_ = d.Ack(false)
-		n++
-	}
 }
 
 // Close 关闭连接
