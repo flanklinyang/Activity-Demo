@@ -2,6 +2,7 @@
 // 用法: go run ./loadtest -users 30000 -qps 1000 -duration 30 \
 //   -dsn "root:xxx@tcp(127.0.0.1:3306)/activity_db?charset=utf8mb4&parseTime=True&loc=Local" \
 //   -mq-url "http://host:15672/api/queues/%2F/activity_signup_queue" -mq-pass xxx -redis-pass xxx
+// 名额与用户数不同（抢报场景）: -users 5000 -quota 100 -burst（同时突发，不按QPS匀速）
 package main
 
 import (
@@ -30,7 +31,9 @@ const (
 
 var (
 	userCount = flag.Int("users", 30000, "用户数（每人报名一次，即总请求数）")
-	targetQPS = flag.Int("qps", 1000, "报名阶段目标QPS")
+	quota     = flag.Int("quota", 0, "活动名额（默认=用户数；设为0则与用户数相同）")
+	burst     = flag.Bool("burst", false, "突发模式：不按QPS匀速，全部请求同时发出")
+	targetQPS = flag.Int("qps", 1000, "报名阶段目标QPS（burst模式忽略）")
 	duration  = flag.Int("duration", 30, "报名阶段持续时间(秒)")
 	dsn       = flag.String("dsn", "", "MySQL DSN，落库校验用（必填）")
 	mqURL     = flag.String("mq-url", "", "RabbitMQ管理API队列地址，如 http://host:15672/api/queues/%2F/activity_signup_queue")
@@ -152,8 +155,16 @@ func main() {
 		return
 	}
 	n := *userCount
+	effQuota := n
+	if *quota > 0 {
+		effQuota = *quota
+	}
 	fmt.Println("======== 报名系统正式压测 ========")
-	fmt.Printf("参数: 用户数=%d 目标QPS=%d 持续=%ds\n", n, *targetQPS, *duration)
+	if *burst {
+		fmt.Printf("参数: 用户数=%d 名额=%d 模式=突发（同时抢报）\n", n, effQuota)
+	} else {
+		fmt.Printf("参数: 用户数=%d 名额=%d 目标QPS=%d 持续=%ds\n", n, effQuota, *targetQPS, *duration)
+	}
 	fmt.Println("开始时间:", time.Now().Format("15:04:05"))
 
 	// ---------- 阶段1: 注册 ----------
@@ -229,9 +240,9 @@ func main() {
 
 	// ---------- 阶段3: 创建活动 ----------
 	m, err := postJSON("/api/activity", tokens[0], map[string]any{
-		"title":       fmt.Sprintf("loadtest-formal-%dqps", *targetQPS),
+		"title":       fmt.Sprintf("loadtest-quota%d", effQuota),
 		"content":     "formal",
-		"total_quota": n,
+		"total_quota": effQuota,
 	})
 	if err != nil {
 		fmt.Println("创建活动失败:", err)
@@ -239,7 +250,7 @@ func main() {
 	}
 	data, _ := m["data"].(map[string]any)
 	activityID := int64(data["ID"].(float64))
-	fmt.Printf("[建活动] id=%d quota=%d\n", activityID, n)
+	fmt.Printf("[建活动] id=%d quota=%d\n", activityID, effQuota)
 
 	// ---------- 阶段4: 受控速率报名 ----------
 	maxDepth := int64(0)
@@ -300,13 +311,15 @@ func main() {
 		}()
 	}
 
-	// 节奏器：按目标QPS分发请求，落后自动追赶
+	// 节奏器：按目标QPS分发请求，落后自动追赶；burst模式跳过节奏，全量同时发出
 	t3 := time.Now()
 	interval := time.Duration(float64(time.Second) / float64(*targetQPS))
 	for i := 0; i < n; i++ {
-		target := t3.Add(time.Duration(i) * interval)
-		if d := time.Until(target); d > 0 {
-			time.Sleep(d)
+		if !*burst {
+			target := t3.Add(time.Duration(i) * interval)
+			if d := time.Until(target); d > 0 {
+				time.Sleep(d)
+			}
 		}
 		jobCh <- i
 	}
@@ -387,9 +400,13 @@ func main() {
 	db.Table("activity_sign_ups").Where("activity_id = ?", activityID).Distinct("user_id").Count(&dbDistinct)
 
 	fmt.Println("-------- 一致性校验 --------")
+	expectedQuota := int64(effQuota - signOK)
+	if expectedQuota < 0 {
+		expectedQuota = 0
+	}
 	fmt.Printf("Redis剩余名额=%d (期望%d) | Redis报名集合=%d (期望%d) | DB记录=%d | DB去重=%d\n",
-		quota, n-signOK, scard, signOK, dbCount, dbDistinct)
-	ok := quota == int64(n-signOK) && scard == int64(signOK) && dbCount == int64(signOK) && dbDistinct == int64(signOK)
+		quota, expectedQuota, scard, signOK, dbCount, dbDistinct)
+	ok := quota == expectedQuota && scard == int64(signOK) && dbCount == int64(signOK) && dbDistinct == int64(signOK)
 	if ok {
 		fmt.Println("结论: 无超卖、无重复、无遗漏，最终一致 ✅")
 	} else {
