@@ -48,11 +48,11 @@ func SignUpActivity(ctx context.Context, activityId, userId int64) error {
 	}
 	switch resp {
 	case 1:
-		return errors.New("你已经报名该活动")
+		return ErrAlreadySignedUp
 	case 2:
-		return errors.New("名额不足")
+		return ErrQuotaExhausted
 	case 3:
-		return errors.New("活动不存在或未开放报名")
+		return ErrActivityMissing
 	}
 
 	// 2. 发送消息给RabbitMQ，异步写入数据库

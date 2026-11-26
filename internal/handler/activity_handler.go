@@ -4,6 +4,7 @@ import (
 	"activity/internal/service"
 	"activity/pkg"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 )
@@ -20,9 +21,21 @@ func CreateActivity(c *gin.Context) {
 		pkg.Fail(c, 400, "参数错误")
 		return
 	}
+	if n := utf8.RuneCountInString(req.Title); n < 1 || n > 128 {
+		pkg.Fail(c, 400, "活动标题长度需为1-128个字符")
+		return
+	}
+	if n := utf8.RuneCountInString(req.Content); n > 5000 {
+		pkg.Fail(c, 400, "活动描述不能超过5000个字符")
+		return
+	}
+	if req.TotalQuota < 1 || req.TotalQuota > 1000000 {
+		pkg.Fail(c, 400, "活动名额需在1-1000000之间")
+		return
+	}
 	act, err := service.CreateActivity(c, req.Title, req.Content, req.TotalQuota)
 	if err != nil {
-		pkg.Fail(c, 400, err.Error())
+		respondErr(c, err)
 		return
 	}
 	pkg.Success(c, act)
@@ -37,7 +50,7 @@ func SignUp(c *gin.Context) {
 	userId, _ := c.Get("user_id")
 	err = service.SignUpActivity(c, activityId, userId.(int64))
 	if err != nil {
-		pkg.Fail(c, 400, err.Error())
+		respondErr(c, err)
 		return
 	}
 	pkg.Success(c, "报名请求提交成功")
