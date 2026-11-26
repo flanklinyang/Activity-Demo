@@ -27,6 +27,7 @@
    定时对账（默认60s）：Redis报名集合 vs MySQL记录 → 差集补发MQ
    门控：近2×间隔内有消费丢弃则跳过本轮补发，防DB故障期间churn
    自愈：修复缺失名额key（DB恢复）、清理孤儿key（含脏报名记录）
+   到期清理：活动超过end_time且DB已同步后，清理其运行期key
 
    监控与健康检查：GET /metrics（Prometheus） /healthz /readyz
 ```
@@ -35,11 +36,11 @@
 
 - **Redis 是运行期事实源**：Lua 脚本原子完成查重与扣名额，`appendfsync always` 落盘即报名成立；MySQL 只是最终一致记录
 - **报名成功语义**：Redis 持久化成功即返回成功；MQ 发布失败只记日志，由对账兜底补发（避免"被告知失败但事实源记着成功"的矛盾）
-- **创建链路一致性**：DB 插入 → Redis 名额初始化，Redis 失败删除 DB 记录补偿返回报错；对账自愈修复缺失名额 key（从 DB 恢复）并清理孤儿 key（含脏报名记录）
+- **创建链路一致性**：DB 插入 → Redis 名额初始化，Redis 失败删除 DB 记录补偿返回报错；对账自愈修复缺失名额 key（从 DB 恢复）、清理孤儿 key（含脏报名记录），活动超过 `end_time` 且 DB 同步完成后自动清理其运行期 key
 - **异步落库幂等**：`(activity_id, user_id)` 联合唯一索引兜底防重复；重试计数放消息体（header 修改不生效）
 - **重试耗尽即丢弃**：消息重试 3 次后丢弃并记录统计，恢复交给对账——不维护死信队列（本架构下死信无正确性职责：报名事实在 Redis，可被对账恢复）
 - **对账丢弃门控**：近 2×间隔内发生过消费丢弃（DB 写入不健康）则跳过本轮补发，避免对账补发与消费重试互相放大
-- **已报名人数**：直接读 Redis 报名集合 `SCARD`（O(1)），MySQL 不维护计数
+- **已报名人数**：运行期直接读 Redis 报名集合 `SCARD`（O(1)）；活动结束后运行期 key 被对账清理，历史数据以 MySQL 为准
 - **生产化配套**：优雅退出（信号→停止接收→按序关闭MQ/Redis/DB）、MQ 断线自动重连、结构化日志（zap JSON）、Prometheus 指标与健康检查、限流（每用户20/s + 公开接口每IP10/s）、输入校验与错误分类（业务错误/系统错误分离，真实 HTTP 状态码）
 
 ## 技术栈
@@ -143,7 +144,7 @@ curl -X POST http://127.0.0.1:8080/api/activity/1/signup -H "Authorization: Bear
 |---|---|---|---|
 | POST | `/api/register` | 注册，body: `{username, password}`（用户名3-50字符，密码6-72字符） | 无 |
 | POST | `/api/login` | 登录，返回 JWT token；失败统一返回"用户名或密码错误"（防账号枚举） | 无 |
-| POST | `/api/activity` | 创建活动，body: `{title, content, total_quota}`（标题1-128字符，名额1-1000000） | Bearer |
+| POST | `/api/activity` | 创建活动，body: `{title, content, total_quota, start_time?, end_time?}`（标题1-128字符，名额1-1000000；时间Unix秒可选，`end_time` 过后对账自动清理运行期key） | Bearer |
 | POST | `/api/activity/:id/signup` | 报名（重复报名/名额不足/活动不存在均返回对应业务错误） | Bearer |
 | GET | `/metrics` | Prometheus 指标 | 无 |
 | GET | `/healthz` | 存活探针 | 无 |
@@ -196,5 +197,5 @@ go run ./loadtest -users 30000 -qps 1000 -duration 30 \
 - **舒适区**：单实例持续 1000 QPS 无积压；2000 QPS 突发可扛（事后收敛），持续 2000 QPS 需扩容消费者（`consumer_count=10`）或批量插入
 - **单点**：Redis/MySQL/RabbitMQ 均为单实例，规模扩大需考虑高可用（主从/哨兵/集群）；Redis 主从切换下 AOF `always` 的持久化保证与主从复制语义需单独评估
 - **创建链路残留窗口**：进程在「DB 插入后、Redis 写入前」崩溃，活动暂时不可报名（fail closed），一个对账周期内自动修复名额 key
-- **对账清理假设**：孤儿 key 清理以「软删除的活动视为不存在」为前提；将来若引入活动结束后清理名额 key 的机制，修复逻辑需加 EndTime 门控
+- **已结束活动清理**：`end_time` 过后且 DB 同步完成（报名记录数覆盖 Redis 集合、队列无积压）的下一轮对账内清理运行期 key；清理后该活动报名天然 fail closed（Lua 返回「活动不存在」），历史报名数据以 MySQL 为准。`end_time` 到清理之间（最长一个对账周期）报名仍可成功，如需严格按结束时间拒绝报名，需在报名 Lua 中增加 EndTime 校验
 - **指标为单实例内存态**：进程重启计数归零，生产可接 Prometheus 持久化；日志为标准输出 JSON，接入采集器即可

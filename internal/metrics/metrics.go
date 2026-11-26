@@ -44,7 +44,7 @@ var (
 
 	ReconcileActionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "reconcile_actions_total",
-		Help: "对账动作计数（repair/clean/resend）",
+		Help: "对账动作计数（repair/clean/resend/expire）",
 	}, []string{"action"})
 
 	QueueDepth = promauto.NewGauge(prometheus.GaugeOpts{

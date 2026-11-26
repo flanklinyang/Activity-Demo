@@ -93,11 +93,13 @@ func ConsumeSignUpMsg(ctx context.Context, msg *mq.SignUpMsg) error {
 }
 
 // 创建活动，初始化Redis名额缓存
-func CreateActivity(ctx context.Context, title, content string, total int64) (*model.Activity, error) {
+func CreateActivity(ctx context.Context, title, content string, total, startTime, endTime int64) (*model.Activity, error) {
 	act := model.Activity{
 		Title:      title,
 		Content:    content,
 		TotalQuota: total,
+		StartTime:  startTime,
+		EndTime:    endTime,
 	}
 	if err := repository.DB.Create(&act).Error; err != nil {
 		return nil, err

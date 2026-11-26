@@ -72,15 +72,17 @@ func Reconcile(ctx context.Context) error {
 func reconcileActivity(ctx context.Context, act *model.Activity) error {
 	quotaKey := fmt.Sprintf("activity:quota:%d", act.ID)
 	signKey := fmt.Sprintf("activity:sign:%d", act.ID)
+	// 已结束活动：key缺失视为已清理不复活；DB同步完成后清理运行期key
+	ended := act.EndTime > 0 && time.Now().Unix() > act.EndTime
+
 	exists, err := redisclient.Rdb.Exists(ctx, quotaKey).Result()
 	if err != nil {
 		return err
 	}
-	if exists == 0 {
+	if exists == 0 && !ended {
 		// 自愈：名额key缺失（创建时Redis写入失败或误删）时从DB恢复。
 		// 安全前提：key缺失期间报名Lua返回「活动不可用」，不会有新报名；
 		// 减去已报名集合大小防手动删key后名额被重置。
-		// 注意：将来若引入「活动结束清理key」逻辑，此处需加EndTime门控。
 		scard, err := redisclient.Rdb.SCard(ctx, signKey).Result()
 		if err != nil {
 			return err
@@ -110,6 +112,17 @@ func reconcileActivity(ctx context.Context, act *model.Activity) error {
 		return err
 	}
 	if dbCount >= scard {
+		if ended {
+			// 已结束且DB已同步：清理运行期key，报名历史以MySQL为准。
+			// 幂等：下轮DEL返回0，不再打日志。key删除后报名Lua对已结束
+			// 活动返回「活动不存在」，天然fail closed。
+			if del, err := redisclient.Rdb.Del(ctx, quotaKey, signKey).Result(); err != nil {
+				return err
+			} else if del > 0 {
+				metrics.ReconcileActionsTotal.WithLabelValues("expire").Inc()
+				logger.L.Infow("对账清理已结束活动key", "activityId", act.ID)
+			}
+		}
 		return nil
 	}
 
