@@ -16,15 +16,19 @@ import (
 )
 
 // StartReconcileLoop 启动定时对账：Redis有报名记录但MySQL没有的，补发MQ消息落库
-func StartReconcileLoop() {
+func StartReconcileLoop(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(reconcileInterval())
 		defer ticker.Stop()
 		for {
-			if err := Reconcile(context.Background()); err != nil {
+			if err := Reconcile(ctx); err != nil {
 				log.Printf("对账失败: %v\n", err)
 			}
-			<-ticker.C
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
 	}()
 }
