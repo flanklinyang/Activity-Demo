@@ -27,8 +27,12 @@ func SignUpActivity(ctx context.Context, activityId, userId int64) error {
 		if redis.call("SISMEMBER", userSignKey, userId) == 1 then
 			return 1
 		end
-		local remain = tonumber(redis.call("GET", quotaKey))
-		if remain <= 0 then
+		local quota = redis.call("GET", quotaKey)
+		if not quota then
+			return 3 -- 活动不存在（名额key未初始化）
+		end
+		local remain = tonumber(quota)
+		if remain == nil or remain <= 0 then
 			return 2
 		end
 		redis.call("DECR", quotaKey)
@@ -47,6 +51,8 @@ func SignUpActivity(ctx context.Context, activityId, userId int64) error {
 		return errors.New("你已经报名该活动")
 	case 2:
 		return errors.New("名额不足")
+	case 3:
+		return errors.New("活动不存在或未开放报名")
 	}
 
 	// 2. 发送消息给RabbitMQ，异步写入数据库
@@ -86,11 +92,16 @@ func CreateActivity(ctx context.Context, title, content string, total int64) (*m
 		Content:    content,
 		TotalQuota: total,
 	}
-	err := repository.DB.Create(&act).Error
-	if err != nil {
+	if err := repository.DB.Create(&act).Error; err != nil {
 		return nil, err
 	}
 	key := fmt.Sprintf("activity:quota:%d", act.ID)
-	redisclient.Rdb.Set(ctx, key, total, 0)
+	if err := redisclient.Rdb.Set(ctx, key, total, 0).Err(); err != nil {
+		// Redis写入失败：删除刚写入的DB记录，保证两边一致
+		if delErr := repository.DB.Delete(&act).Error; delErr != nil {
+			log.Printf("Redis写入失败且补偿删除DB失败, activityId:%d redisErr:%v delErr:%v\n", act.ID, err, delErr)
+		}
+		return nil, err
+	}
 	return &act, nil
 }
