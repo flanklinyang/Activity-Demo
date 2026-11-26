@@ -24,7 +24,7 @@ rabbitmq:
 reconcile:
   interval_second: 60
 
-# 限流：每用户/每IP每秒请求数（0或缺省用代码默认：用户20、IP10）
+# 限流：每用户/每IP每秒请求数（0或缺省用代码默认：用户20、IP10；ip_per_sec=-1关闭IP限流，压测用）
 ratelimit:
   user_per_sec: 20
   ip_per_sec: 10
