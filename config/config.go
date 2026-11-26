@@ -28,6 +28,10 @@ type AppConfig struct {
 	Reconcile struct {
 		IntervalSecond int `mapstructure:"interval_second"`
 	} `mapstructure:"reconcile"`
+	Ratelimit struct {
+		UserPerSec int `mapstructure:"user_per_sec"`
+		IPPerSec   int `mapstructure:"ip_per_sec"`
+	} `mapstructure:"ratelimit"`
 	Jwt struct {
 		Secret     string `mapstructure:"secret"`
 		ExpireHour int    `mapstructure:"expire_hour"`

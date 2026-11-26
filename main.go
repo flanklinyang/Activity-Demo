@@ -49,10 +49,14 @@ func main() {
 	service.StartReconcileLoop(ctx)
 
 	r := gin.New()
+	// 不信任任何代理头，ClientIP 只取真实对端地址，防 X-Forwarded-For 伪造绕过IP限流；
+	// 部署在反向代理后时改为 r.SetTrustedProxies([]string{"代理IP"})
+	_ = r.SetTrustedProxies(nil)
 	r.Use(middleware.Recover())
 
-	// 公开路由
+	// 公开路由（按IP限流，防撞库与密码爆破）
 	public := r.Group("/api")
+	public.Use(middleware.IPLimiter())
 	{
 		public.POST("/register", handler.Register)
 		public.POST("/login", handler.Login)
