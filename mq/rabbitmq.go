@@ -2,11 +2,11 @@ package mq
 
 import (
 	"activity/config"
+	"activity/internal/logger"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -140,7 +140,7 @@ func watchConnection() {
 		notify := c.NotifyClose(make(chan *amqp091.Error, 1))
 		select {
 		case err := <-notify:
-			log.Printf("RabbitMQ连接断开: %v, 开始重连\n", err)
+			logger.L.Errorw("RabbitMQ连接断开，开始重连", "err", err)
 			reconnect()
 		case <-stopCh:
 			return
@@ -172,12 +172,12 @@ func reconnect() {
 				if old != nil {
 					_ = old.Close()
 				}
-				log.Println("RabbitMQ重连成功")
+				logger.L.Infow("RabbitMQ重连成功")
 				return
 			}
 			_ = newConn.Close()
 		}
-		log.Printf("RabbitMQ重连失败: %v, %v后重试\n", err, backoff)
+		logger.L.Errorw("RabbitMQ重连失败", "err", err, "backoff", backoff.String())
 		select {
 		case <-stopCh:
 			return
@@ -266,7 +266,7 @@ func consumeLoop(id int, callback func(ctx context.Context, msg *SignUpMsg) erro
 		}
 		ch, err := c.Channel()
 		if err != nil {
-			log.Printf("消费者%d创建通道失败: %v, 3秒后重试\n", id, err)
+			logger.L.Errorw("消费者创建通道失败", "consumer", id, "err", err)
 			if !sleepOrStop(3 * time.Second) {
 				return
 			}
@@ -275,7 +275,7 @@ func consumeLoop(id int, callback func(ctx context.Context, msg *SignUpMsg) erro
 		// 每通道预取20条；通道死亡时未确认消息由broker重新分发给其他消费者
 		if err := ch.Qos(20, 0, false); err != nil {
 			_ = ch.Close()
-			log.Printf("消费者%d设置Qos失败: %v, 3秒后重试\n", id, err)
+			logger.L.Errorw("消费者设置Qos失败", "consumer", id, "err", err)
 			if !sleepOrStop(3 * time.Second) {
 				return
 			}
@@ -292,20 +292,20 @@ func consumeLoop(id int, callback func(ctx context.Context, msg *SignUpMsg) erro
 		)
 		if err != nil {
 			_ = ch.Close()
-			log.Printf("消费者%d订阅失败: %v, 3秒后重试\n", id, err)
+			logger.L.Errorw("消费者订阅失败", "consumer", id, "err", err)
 			if !sleepOrStop(3 * time.Second) {
 				return
 			}
 			continue
 		}
-		log.Printf("消费者%d已启动\n", id)
+		logger.L.Infow("消费者已启动", "consumer", id)
 		consumeDeliveries(id, deliveries, callback)
 		_ = ch.Close()
 		select {
 		case <-stopCh:
 			return
 		default:
-			log.Printf("消费者%d通道断开, 3秒后重建\n", id)
+			logger.L.Infow("消费者通道断开，3秒后重建", "consumer", id)
 			if !sleepOrStop(3 * time.Second) {
 				return
 			}
@@ -338,7 +338,7 @@ func consumeDeliveries(id int, deliveries <-chan amqp091.Delivery, callback func
 func processDelivery(id int, d amqp091.Delivery, signMsg *SignUpMsg, callback func(ctx context.Context, msg *SignUpMsg) error) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("消费者%d处理消息panic: %v, 消息重回队列\n", id, r)
+			logger.L.Errorw("消费者处理消息panic，消息重回队列", "consumer", id, "err", r)
 			_ = d.Nack(false, true)
 		}
 	}()
@@ -347,7 +347,8 @@ func processDelivery(id int, d amqp091.Delivery, signMsg *SignUpMsg, callback fu
 			// 超过最大重试次数：Nack不重回队列，消息丢弃；报名事实仍在Redis，由定时对账补发
 			droppedCount.Add(1)
 			lastDropAt.Store(time.Now().Unix())
-			log.Printf("消息重试耗尽已丢弃，等待对账补发, activityId:%d userId:%d err:%v\n", signMsg.ActivityId, signMsg.StudentId, err)
+			logger.L.Errorw("消息重试耗尽已丢弃，等待对账补发",
+				"activityId", signMsg.ActivityId, "userId", signMsg.StudentId, "err", err)
 			_ = d.Nack(false, false)
 		} else {
 			// 重试次数+1并重新发布（消息体重发，计数真实递增）
@@ -355,10 +356,11 @@ func processDelivery(id int, d amqp091.Delivery, signMsg *SignUpMsg, callback fu
 			body, _ := json.Marshal(signMsg)
 			if pubErr := publishWithConfirm(context.Background(), body); pubErr != nil {
 				// 重新发布失败：Nack重回队列（保留原重试次数），等待broker重投后重试
-				log.Printf("重试消息发布失败: %v, 原消息重回队列\n", pubErr)
+				logger.L.Errorw("重试消息发布失败，原消息重回队列", "err", pubErr)
 				_ = d.Nack(false, true)
 			} else {
-				log.Printf("消费失败，重试 %d/%d, err:%v\n", signMsg.RetryCount, maxRetryCount, err)
+				logger.L.Warnw("消费失败，重试",
+					"retry", signMsg.RetryCount, "maxRetry", maxRetryCount, "err", err)
 				_ = d.Ack(false)
 			}
 		}

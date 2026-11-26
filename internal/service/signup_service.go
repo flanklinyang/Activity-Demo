@@ -4,15 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 
-	"github.com/redis/go-redis/v9"
-	"gorm.io/gorm"
-
+	"activity/internal/logger"
 	"activity/model"
 	"activity/mq"
 	"activity/redisclient"
 	"activity/repository"
+
+	"github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
 )
 
 // 活动报名：Redis Lua扣库存（AOF fsync后响应=事实源），发送RabbitMQ消息异步落库
@@ -62,7 +62,8 @@ func SignUpActivity(ctx context.Context, activityId, userId int64) error {
 		StudentId:  userId,
 	}
 	if err := mq.Publish(ctx, msg); err != nil {
-		log.Printf("报名消息发布失败，等待对账补发, activityId:%d userId:%d err:%v\n", activityId, userId, err)
+		logger.L.Errorw("报名消息发布失败，等待对账补发",
+			"activityId", activityId, "userId", userId, "err", err)
 	}
 	return nil
 }
@@ -99,7 +100,8 @@ func CreateActivity(ctx context.Context, title, content string, total int64) (*m
 	if err := redisclient.Rdb.Set(ctx, key, total, 0).Err(); err != nil {
 		// Redis写入失败：删除刚写入的DB记录，保证两边一致
 		if delErr := repository.DB.Delete(&act).Error; delErr != nil {
-			log.Printf("Redis写入失败且补偿删除DB失败, activityId:%d redisErr:%v delErr:%v\n", act.ID, err, delErr)
+			logger.L.Errorw("Redis写入失败且补偿删除DB失败",
+				"activityId", act.ID, "redisErr", err, "delErr", delErr)
 		}
 		return nil, err
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"activity/config"
 	"activity/internal/handler"
+	"activity/internal/logger"
 	"activity/internal/service"
 	"activity/middleware"
 	"activity/mq"
@@ -25,22 +26,27 @@ func main() {
 	if err := config.Init(); err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	// 结构化日志（依赖配置，故先于其他组件）
+	if err := logger.Init(); err != nil {
+		log.Fatalf("日志初始化失败: %v", err)
+	}
+	defer logger.Sync()
 	// 初始化数据库
 	if err := repository.InitDB(); err != nil {
-		log.Fatalf("数据库初始化失败: %v", err)
+		logger.L.Fatalf("数据库初始化失败: %v", err)
 	}
 	// redis
 	if err := redisclient.Init(); err != nil {
-		log.Fatalf("Redis初始化失败: %v", err)
+		logger.L.Fatalf("Redis初始化失败: %v", err)
 	}
 	// rabbitmq
 	if err := mq.InitRabbitMQ(); err != nil {
-		log.Fatalf("RabbitMQ初始化失败: %v", err)
+		logger.L.Fatalf("RabbitMQ初始化失败: %v", err)
 	}
 	// 启动消费者
 	err := mq.StartConsumer(service.ConsumeSignUpMsg)
 	if err != nil {
-		log.Fatalf("启动消费者失败: %v", err)
+		logger.L.Fatalf("启动消费者失败: %v", err)
 	}
 	// 优雅退出：收到 SIGINT/SIGTERM 后停止接收请求并按序关闭依赖
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -77,19 +83,19 @@ func main() {
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("服务启动失败: %v", err)
+			logger.L.Fatalf("服务启动失败: %v", err)
 		}
 	}()
-	log.Println("服务启动", config.Conf.Server.Port)
+	logger.L.Infof("服务启动 %s", config.Conf.Server.Port)
 
 	<-ctx.Done()
-	log.Println("收到退出信号，开始优雅关闭")
+	logger.L.Info("收到退出信号，开始优雅关闭")
 
 	// 1. 停止接收新请求，等待在途请求完成
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP优雅关闭超时: %v\n", err)
+		logger.L.Errorf("HTTP优雅关闭超时: %v", err)
 	}
 	// 2. 关闭MQ（停止消费与重连）、Redis、MySQL
 	mq.Close()
@@ -97,5 +103,5 @@ func main() {
 	if sqlDB, err := repository.DB.DB(); err == nil {
 		_ = sqlDB.Close()
 	}
-	log.Println("已退出")
+	logger.L.Info("已退出")
 }

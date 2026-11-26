@@ -1,10 +1,10 @@
 package handler
 
 import (
+	"activity/internal/logger"
 	"activity/internal/service"
 	"activity/pkg"
 	"errors"
-	"log"
 
 	"github.com/gin-gonic/gin"
 )
@@ -17,6 +17,6 @@ func respondErr(c *gin.Context, err error) {
 		pkg.Fail(c, 400, biz.Msg)
 		return
 	}
-	log.Printf("系统错误: %s %s err:%v\n", c.Request.Method, c.FullPath(), err)
+	logger.L.Errorw("系统错误", "method", c.Request.Method, "path", c.FullPath(), "err", err)
 	pkg.Fail(c, 500, "服务繁忙，请稍后重试")
 }

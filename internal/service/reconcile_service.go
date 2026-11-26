@@ -3,12 +3,12 @@ package service
 import (
 	"context"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 	"time"
 
 	"activity/config"
+	"activity/internal/logger"
 	"activity/model"
 	"activity/mq"
 	"activity/redisclient"
@@ -22,7 +22,7 @@ func StartReconcileLoop(ctx context.Context) {
 		defer ticker.Stop()
 		for {
 			if err := Reconcile(ctx); err != nil {
-				log.Printf("对账失败: %v\n", err)
+				logger.L.Errorw("对账失败", "err", err)
 			}
 			select {
 			case <-ctx.Done():
@@ -49,17 +49,17 @@ func Reconcile(ctx context.Context) error {
 	}
 	// 近期有消费失败丢弃=DB写入不健康，跳过本轮补发，避免对账补发与消费重试互相放大
 	if dropped, recent := mq.DroppedRecently(2 * reconcileInterval()); recent {
-		log.Printf("近期有%d条消息消费失败被丢弃，跳过本轮补发，等待DB恢复\n", dropped)
+		logger.L.Warnw("近期有消息消费失败被丢弃，跳过本轮补发，等待DB恢复", "dropped", dropped)
 	} else {
 		for i := range activities {
 			if err := reconcileActivity(ctx, &activities[i]); err != nil {
-				log.Printf("对账活动%d失败: %v\n", activities[i].ID, err)
+				logger.L.Errorw("对账活动失败", "activityId", activities[i].ID, "err", err)
 			}
 		}
 	}
 	// 孤儿key清理不补发MQ、无放大风险，不受丢弃门控影响
 	if err := reconcileOrphans(ctx); err != nil {
-		log.Printf("孤儿key清理失败: %v\n", err)
+		logger.L.Errorw("孤儿key清理失败", "err", err)
 	}
 	return nil
 }
@@ -87,7 +87,7 @@ func reconcileActivity(ctx context.Context, act *model.Activity) error {
 		if err := redisclient.Rdb.Set(ctx, quotaKey, repairQuota, 0).Err(); err != nil {
 			return err
 		}
-		log.Printf("对账修复缺失名额key, activityId:%d quota:%d\n", act.ID, repairQuota)
+		logger.L.Infow("对账修复缺失名额key", "activityId", act.ID, "quota", repairQuota)
 	}
 	// 业务队列有积压=存在在途消息，DB滞后属正常，跳过避免重复补发
 	if depth, err := mq.QueueDepth(); err == nil && depth > 0 {
@@ -126,9 +126,9 @@ func reconcileActivity(ctx context.Context, act *model.Activity) error {
 		}
 		msg := &mq.SignUpMsg{ActivityId: int64(act.ID), StudentId: uid}
 		if err := mq.Publish(ctx, msg); err != nil {
-			log.Printf("对账补发消息失败, activityId:%d userId:%d err:%v\n", act.ID, uid, err)
+			logger.L.Errorw("对账补发消息失败", "activityId", act.ID, "userId", uid, "err", err)
 		} else {
-			log.Printf("对账补发消息, activityId:%d userId:%d\n", act.ID, uid)
+			logger.L.Infow("对账补发消息", "activityId", act.ID, "userId", uid)
 		}
 	}
 	return nil
@@ -164,13 +164,13 @@ func reconcileOrphans(ctx context.Context) error {
 		if err := redisclient.Rdb.Del(ctx,
 			fmt.Sprintf("activity:quota:%d", id),
 			fmt.Sprintf("activity:sign:%d", id)).Err(); err != nil {
-			log.Printf("清理孤儿key失败, activityId:%d err:%v\n", id, err)
+			logger.L.Errorw("清理孤儿key失败", "activityId", id, "err", err)
 			continue
 		}
 		if err := repository.DB.Unscoped().Where("activity_id = ?", id).Delete(&model.ActivitySignUp{}).Error; err != nil {
-			log.Printf("清理孤儿报名记录失败, activityId:%d err:%v\n", id, err)
+			logger.L.Errorw("清理孤儿报名记录失败", "activityId", id, "err", err)
 		}
-		log.Printf("对账清理孤儿key, activityId:%d\n", id)
+		logger.L.Infow("对账清理孤儿key", "activityId", id)
 	}
 	return nil
 }
