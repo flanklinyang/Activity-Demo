@@ -30,6 +30,8 @@ const (
 const publishPoolSize = 16
 
 var (
+	// conn/channel/pubPool 断线重连时整体原子替换，读写均走 connMu
+	connMu  sync.RWMutex
 	conn    *amqp091.Connection
 	channel *amqp091.Channel
 	// pubPool 发布通道池：每个通道独立串行确认，池化并行发布，避免单通道确认等待串行化
@@ -38,6 +40,9 @@ var (
 	// droppedCount/lastDropAt 重试耗尽被丢弃的消息统计，供对账判断DB写入是否健康
 	droppedCount atomic.Uint64
 	lastDropAt   atomic.Int64
+
+	stopCh   = make(chan struct{})
+	stopOnce sync.Once
 )
 
 // pubChannel 一个独立发布通道，mu 保证该通道同一时刻只有一个待确认消息
@@ -47,56 +52,142 @@ type pubChannel struct {
 	mu       sync.Mutex
 }
 
-// InitRabbitMQ 初始化连接、交换机、队列，并开启生产者确认模式
+func rabbitURL() string {
+	return fmt.Sprintf("amqp://%s:%s@%s/", config.Conf.RabbitMQ.User, config.Conf.RabbitMQ.Password, config.Conf.RabbitMQ.Addr)
+}
+
+// InitRabbitMQ 建立连接、声明交换机/队列/发布池，并启动断线重连监听
 func InitRabbitMQ() error {
-	url := fmt.Sprintf("amqp://%s:%s@%s/", config.Conf.RabbitMQ.User, config.Conf.RabbitMQ.Password, config.Conf.RabbitMQ.Addr)
-	var err error
-	conn, err = amqp091.Dial(url)
+	newConn, err := amqp091.Dial(rabbitURL())
 	if err != nil {
 		return err
 	}
-	channel, err = conn.Channel()
+	ch, pool, err := setup(newConn)
 	if err != nil {
+		_ = newConn.Close()
 		return err
 	}
+	connMu.Lock()
+	conn = newConn
+	channel = ch
+	pubPool = pool
+	connMu.Unlock()
+	go watchConnection()
+	return nil
+}
 
+// setup 在给定连接上声明交换机/队列并创建发布通道池，返回局部变量由调用方原子替换
+func setup(c *amqp091.Connection) (*amqp091.Channel, []*pubChannel, error) {
+	ch, err := c.Channel()
+	if err != nil {
+		return nil, nil, err
+	}
 	// 声明业务交换机
-	err = channel.ExchangeDeclare(exchangeName, "direct", true, false, false, false, nil)
-	if err != nil {
-		return err
+	if err = ch.ExchangeDeclare(exchangeName, "direct", true, false, false, false, nil); err != nil {
+		_ = ch.Close()
+		return nil, nil, err
 	}
-
 	// 业务队列（无死信配置：重试耗尽直接丢弃，由定时对账兜底补发）
-	_, err = channel.QueueDeclare(queueName, true, false, false, false, nil)
-	if err != nil {
-		return err
+	if _, err = ch.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
+		_ = ch.Close()
+		return nil, nil, err
 	}
-	err = channel.QueueBind(queueName, queueName, exchangeName, false, nil)
-	if err != nil {
-		return err
+	if err = ch.QueueBind(queueName, queueName, exchangeName, false, nil); err != nil {
+		_ = ch.Close()
+		return nil, nil, err
 	}
-
-	// Qos预取，控制消费并发，最多同时处理10条消息，保护数据库
-	err = channel.Qos(10, 0, false)
-	if err != nil {
-		return err
-	}
-
 	// 发布通道池：每个通道开启独立确认流
+	var pool []*pubChannel
 	for range publishPoolSize {
-		ch, err := conn.Channel()
+		pc, err := c.Channel()
 		if err != nil {
-			return err
+			_ = ch.Close()
+			closePubPool(pool)
+			return nil, nil, err
 		}
-		if err = ch.Confirm(false); err != nil {
-			return err
+		if err = pc.Confirm(false); err != nil {
+			_ = pc.Close()
+			_ = ch.Close()
+			closePubPool(pool)
+			return nil, nil, err
 		}
-		pubPool = append(pubPool, &pubChannel{
-			ch:       ch,
-			confirms: ch.NotifyPublish(make(chan amqp091.Confirmation, 1)),
+		pool = append(pool, &pubChannel{
+			ch:       pc,
+			confirms: pc.NotifyPublish(make(chan amqp091.Confirmation, 1)),
 		})
 	}
-	return nil
+	return ch, pool, nil
+}
+
+func closePubPool(pool []*pubChannel) {
+	for _, p := range pool {
+		_ = p.ch.Close()
+	}
+}
+
+// watchConnection 监听连接断开并驱动重连；每次重连成功后监听新连接
+func watchConnection() {
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		c := getConn()
+		if c == nil {
+			return
+		}
+		notify := c.NotifyClose(make(chan *amqp091.Error, 1))
+		select {
+		case err := <-notify:
+			log.Printf("RabbitMQ连接断开: %v, 开始重连\n", err)
+			reconnect()
+		case <-stopCh:
+			return
+		}
+	}
+}
+
+// reconnect 指数退避重拨，成功后原子替换全局conn/channel/pubPool
+func reconnect() {
+	backoff := time.Second
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		newConn, err := amqp091.Dial(rabbitURL())
+		if err == nil {
+			var ch *amqp091.Channel
+			var pool []*pubChannel
+			if ch, pool, err = setup(newConn); err == nil {
+				connMu.Lock()
+				old := conn
+				conn = newConn
+				channel = ch
+				pubPool = pool
+				connMu.Unlock()
+				// 关闭旧连接：旧连接上的消费者通道随之退出，重建到新连接
+				if old != nil {
+					_ = old.Close()
+				}
+				log.Println("RabbitMQ重连成功")
+				return
+			}
+			_ = newConn.Close()
+		}
+		log.Printf("RabbitMQ重连失败: %v, %v后重试\n", err, backoff)
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+	}
 }
 
 // Publish 发布报名消息并等待 broker 确认（确认=消息已落盘到队列）
@@ -110,7 +201,11 @@ func Publish(ctx context.Context, msg *SignUpMsg) error {
 
 // publishWithConfirm 从发布池取一个通道发送消息并等待该通道的确认或超时
 func publishWithConfirm(ctx context.Context, body []byte) error {
-	pc := pubPool[int(pubIdx.Add(1)%publishPoolSize)]
+	pool := getPubPool()
+	if len(pool) == 0 {
+		return errors.New("发布通道池未初始化")
+	}
+	pc := pool[int(pubIdx.Add(1)%uint64(len(pool)))]
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
@@ -154,20 +249,36 @@ func StartConsumer(callback func(ctx context.Context, msg *SignUpMsg) error) err
 	return nil
 }
 
-// consumeLoop 单消费者主循环：通道断开后自动重建
+// consumeLoop 单消费者主循环：连接断开后自动重建（重连由 watchConnection 负责）
 func consumeLoop(id int, callback func(ctx context.Context, msg *SignUpMsg) error) {
 	for {
-		ch, err := conn.Channel()
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		c := getConn()
+		if c == nil {
+			if !sleepOrStop(3 * time.Second) {
+				return
+			}
+			continue
+		}
+		ch, err := c.Channel()
 		if err != nil {
 			log.Printf("消费者%d创建通道失败: %v, 3秒后重试\n", id, err)
-			time.Sleep(3 * time.Second)
+			if !sleepOrStop(3 * time.Second) {
+				return
+			}
 			continue
 		}
 		// 每通道预取20条；通道死亡时未确认消息由broker重新分发给其他消费者
 		if err := ch.Qos(20, 0, false); err != nil {
 			_ = ch.Close()
 			log.Printf("消费者%d设置Qos失败: %v, 3秒后重试\n", id, err)
-			time.Sleep(3 * time.Second)
+			if !sleepOrStop(3 * time.Second) {
+				return
+			}
 			continue
 		}
 		deliveries, err := ch.Consume(
@@ -182,14 +293,33 @@ func consumeLoop(id int, callback func(ctx context.Context, msg *SignUpMsg) erro
 		if err != nil {
 			_ = ch.Close()
 			log.Printf("消费者%d订阅失败: %v, 3秒后重试\n", id, err)
-			time.Sleep(3 * time.Second)
+			if !sleepOrStop(3 * time.Second) {
+				return
+			}
 			continue
 		}
 		log.Printf("消费者%d已启动\n", id)
 		consumeDeliveries(id, deliveries, callback)
 		_ = ch.Close()
-		log.Printf("消费者%d通道断开, 3秒后重建\n", id)
-		time.Sleep(3 * time.Second)
+		select {
+		case <-stopCh:
+			return
+		default:
+			log.Printf("消费者%d通道断开, 3秒后重建\n", id)
+			if !sleepOrStop(3 * time.Second) {
+				return
+			}
+		}
+	}
+}
+
+// sleepOrStop 等待指定时长，期间收到停止信号返回false
+func sleepOrStop(d time.Duration) bool {
+	select {
+	case <-stopCh:
+		return false
+	case <-time.After(d):
+		return true
 	}
 }
 
@@ -246,18 +376,41 @@ func DroppedRecently(since time.Duration) (uint64, bool) {
 
 // QueueDepth 业务队列积压数量
 func QueueDepth() (int, error) {
-	q, err := channel.QueueDeclarePassive(queueName, true, false, false, false, nil)
+	ch := getChannel()
+	if ch == nil {
+		return 0, errors.New("channel未初始化")
+	}
+	q, err := ch.QueueDeclarePassive(queueName, true, false, false, false, nil)
 	if err != nil {
 		return 0, err
 	}
 	return q.Messages, nil
 }
 
-// Close 关闭连接
+// Close 停止重连与消费，关闭连接
 func Close() {
-	for _, pc := range pubPool {
-		_ = pc.ch.Close()
+	stopOnce.Do(func() { close(stopCh) })
+	connMu.Lock()
+	defer connMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
 	}
-	_ = channel.Close()
-	_ = conn.Close()
+}
+
+func getConn() *amqp091.Connection {
+	connMu.RLock()
+	defer connMu.RUnlock()
+	return conn
+}
+
+func getChannel() *amqp091.Channel {
+	connMu.RLock()
+	defer connMu.RUnlock()
+	return channel
+}
+
+func getPubPool() []*pubChannel {
+	connMu.RLock()
+	defer connMu.RUnlock()
+	return pubPool
 }
