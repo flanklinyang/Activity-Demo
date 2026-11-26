@@ -4,6 +4,7 @@ import (
 	"activity/config"
 	"activity/internal/handler"
 	"activity/internal/logger"
+	"activity/internal/metrics"
 	"activity/internal/service"
 	"activity/middleware"
 	"activity/mq"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -58,7 +60,13 @@ func main() {
 	// 不信任任何代理头，ClientIP 只取真实对端地址，防 X-Forwarded-For 伪造绕过IP限流；
 	// 部署在反向代理后时改为 r.SetTrustedProxies([]string{"代理IP"})
 	_ = r.SetTrustedProxies(nil)
+	r.Use(metrics.GinMiddleware())
 	r.Use(middleware.Recover())
+
+	// 监控与健康检查（不鉴权不限流）
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	r.GET("/healthz", handler.Healthz)
+	r.GET("/readyz", handler.Readyz)
 
 	// 公开路由（按IP限流，防撞库与密码爆破）
 	public := r.Group("/api")

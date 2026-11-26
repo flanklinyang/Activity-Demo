@@ -9,6 +9,7 @@ import (
 
 	"activity/config"
 	"activity/internal/logger"
+	"activity/internal/metrics"
 	"activity/model"
 	"activity/mq"
 	"activity/redisclient"
@@ -43,6 +44,10 @@ func reconcileInterval() time.Duration {
 
 // Reconcile 对全部活动执行一次对账
 func Reconcile(ctx context.Context) error {
+	start := time.Now()
+	defer func() {
+		metrics.ReconcileDuration.Observe(time.Since(start).Seconds())
+	}()
 	var activities []model.Activity
 	if err := repository.DB.Find(&activities).Error; err != nil {
 		return err
@@ -87,6 +92,7 @@ func reconcileActivity(ctx context.Context, act *model.Activity) error {
 		if err := redisclient.Rdb.Set(ctx, quotaKey, repairQuota, 0).Err(); err != nil {
 			return err
 		}
+		metrics.ReconcileActionsTotal.WithLabelValues("repair").Inc()
 		logger.L.Infow("对账修复缺失名额key", "activityId", act.ID, "quota", repairQuota)
 	}
 	// 业务队列有积压=存在在途消息，DB滞后属正常，跳过避免重复补发
@@ -128,6 +134,7 @@ func reconcileActivity(ctx context.Context, act *model.Activity) error {
 		if err := mq.Publish(ctx, msg); err != nil {
 			logger.L.Errorw("对账补发消息失败", "activityId", act.ID, "userId", uid, "err", err)
 		} else {
+			metrics.ReconcileActionsTotal.WithLabelValues("resend").Inc()
 			logger.L.Infow("对账补发消息", "activityId", act.ID, "userId", uid)
 		}
 	}
@@ -170,6 +177,7 @@ func reconcileOrphans(ctx context.Context) error {
 		if err := repository.DB.Unscoped().Where("activity_id = ?", id).Delete(&model.ActivitySignUp{}).Error; err != nil {
 			logger.L.Errorw("清理孤儿报名记录失败", "activityId", id, "err", err)
 		}
+		metrics.ReconcileActionsTotal.WithLabelValues("clean").Inc()
 		logger.L.Infow("对账清理孤儿key", "activityId", id)
 	}
 	return nil

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"activity/internal/logger"
+	"activity/internal/metrics"
 	"activity/model"
 	"activity/mq"
 	"activity/redisclient"
@@ -44,16 +45,21 @@ func SignUpActivity(ctx context.Context, activityId, userId int64) error {
 	keys := []string{quotaKey, signSetKey}
 	resp, err := luaScript.Run(ctx, redisclient.Rdb, keys, activityId, userId).Int64()
 	if err != nil {
+		metrics.SignupTotal.WithLabelValues("error").Inc()
 		return err
 	}
 	switch resp {
 	case 1:
+		metrics.SignupTotal.WithLabelValues("already_signed").Inc()
 		return ErrAlreadySignedUp
 	case 2:
+		metrics.SignupTotal.WithLabelValues("quota_exhausted").Inc()
 		return ErrQuotaExhausted
 	case 3:
+		metrics.SignupTotal.WithLabelValues("activity_missing").Inc()
 		return ErrActivityMissing
 	}
+	metrics.SignupTotal.WithLabelValues("ok").Inc()
 
 	// 2. 发送消息给RabbitMQ，异步写入数据库
 	// Redis已持久化，报名事实成立；发布失败只告警，由定时对账兜底补发

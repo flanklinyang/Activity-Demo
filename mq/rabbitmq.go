@@ -3,6 +3,7 @@ package mq
 import (
 	"activity/config"
 	"activity/internal/logger"
+	"activity/internal/metrics"
 	"context"
 	"encoding/json"
 	"errors"
@@ -214,6 +215,7 @@ func publishWithConfirm(ctx context.Context, body []byte) error {
 		Body:        body,
 	}
 	if err := pc.ch.PublishWithContext(ctx, exchangeName, queueName, false, false, publish); err != nil {
+		metrics.MQPublishTotal.WithLabelValues("fail").Inc()
 		return err
 	}
 
@@ -224,8 +226,10 @@ func publishWithConfirm(ctx context.Context, body []byte) error {
 	select {
 	case conf := <-pc.confirms:
 		if !conf.Ack {
+			metrics.MQPublishTotal.WithLabelValues("fail").Inc()
 			return errors.New("broker拒绝消息(nack)")
 		}
+		metrics.MQPublishTotal.WithLabelValues("ok").Inc()
 		return nil
 	case <-time.After(timeout):
 		// 清掉可能迟到的确认，避免污染下一次等待
@@ -233,6 +237,7 @@ func publishWithConfirm(ctx context.Context, body []byte) error {
 		case <-pc.confirms:
 		default:
 		}
+		metrics.MQPublishTotal.WithLabelValues("fail").Inc()
 		return errors.New("等待broker确认超时")
 	}
 }
@@ -347,6 +352,7 @@ func processDelivery(id int, d amqp091.Delivery, signMsg *SignUpMsg, callback fu
 			// 超过最大重试次数：Nack不重回队列，消息丢弃；报名事实仍在Redis，由定时对账补发
 			droppedCount.Add(1)
 			lastDropAt.Store(time.Now().Unix())
+			metrics.MQConsumeTotal.WithLabelValues("drop").Inc()
 			logger.L.Errorw("消息重试耗尽已丢弃，等待对账补发",
 				"activityId", signMsg.ActivityId, "userId", signMsg.StudentId, "err", err)
 			_ = d.Nack(false, false)
@@ -359,6 +365,7 @@ func processDelivery(id int, d amqp091.Delivery, signMsg *SignUpMsg, callback fu
 				logger.L.Errorw("重试消息发布失败，原消息重回队列", "err", pubErr)
 				_ = d.Nack(false, true)
 			} else {
+				metrics.MQConsumeTotal.WithLabelValues("retry").Inc()
 				logger.L.Warnw("消费失败，重试",
 					"retry", signMsg.RetryCount, "maxRetry", maxRetryCount, "err", err)
 				_ = d.Ack(false)
@@ -366,6 +373,7 @@ func processDelivery(id int, d amqp091.Delivery, signMsg *SignUpMsg, callback fu
 		}
 	} else {
 		// 消费成功，ACK
+		metrics.MQConsumeTotal.WithLabelValues("ok").Inc()
 		_ = d.Ack(false)
 	}
 }
@@ -376,7 +384,7 @@ func DroppedRecently(since time.Duration) (uint64, bool) {
 	return droppedCount.Load(), time.Since(t) < since
 }
 
-// QueueDepth 业务队列积压数量
+// QueueDepth 业务队列积压数量（同时刷新积压指标）
 func QueueDepth() (int, error) {
 	ch := getChannel()
 	if ch == nil {
@@ -386,7 +394,14 @@ func QueueDepth() (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	metrics.QueueDepth.Set(float64(q.Messages))
 	return q.Messages, nil
+}
+
+// IsConnected 连接是否存活（供就绪探针使用）
+func IsConnected() bool {
+	c := getConn()
+	return c != nil && !c.IsClosed()
 }
 
 // Close 停止重连与消费，关闭连接
