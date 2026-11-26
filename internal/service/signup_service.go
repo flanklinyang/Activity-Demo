@@ -92,7 +92,7 @@ func ConsumeSignUpMsg(ctx context.Context, msg *mq.SignUpMsg) error {
 	return err
 }
 
-// 创建活动，初始化Redis名额缓存
+// 创建活动：MySQL是唯一事实源，Redis名额key只是派生缓存（创建时预热）
 func CreateActivity(ctx context.Context, title, content string, total, startTime, endTime int64) (*model.Activity, error) {
 	act := model.Activity{
 		Title:      title,
@@ -104,14 +104,12 @@ func CreateActivity(ctx context.Context, title, content string, total, startTime
 	if err := repository.DB.Create(&act).Error; err != nil {
 		return nil, err
 	}
+	// 名额key预热：失败不影响创建成功（事实源在MySQL），对账一个周期内自愈修复。
+	// 不做删除补偿——消除双写的删除歧义与孤儿窗口；Redis故障时报名链路本身
+	// 不可用，且业务上报名通常数天后才开放，60s修复窗口无感
 	key := fmt.Sprintf("activity:quota:%d", act.ID)
 	if err := redisclient.Rdb.Set(ctx, key, total, 0).Err(); err != nil {
-		// Redis写入失败：删除刚写入的DB记录，保证两边一致
-		if delErr := repository.DB.Delete(&act).Error; delErr != nil {
-			logger.L.Errorw("Redis写入失败且补偿删除DB失败",
-				"activityId", act.ID, "redisErr", err, "delErr", delErr)
-		}
-		return nil, err
+		logger.L.Warnw("名额key写入失败，等待对账修复", "activityId", act.ID, "err", err)
 	}
 	return &act, nil
 }

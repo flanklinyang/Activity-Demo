@@ -155,7 +155,7 @@ func reconcileActivity(ctx context.Context, act *model.Activity) error {
 }
 
 // reconcileOrphans 清理孤儿key：Redis有名额key但DB中活动不存在（含软删除）。
-// 来源：SET歧义窗口（Redis超时但实际写入，补偿删除DB后残留）或手动造key。
+// 来源：手动造key或历史遗留（创建链路为MySQL单写+缓存预热，正常流程不产生孤儿）。
 // 同时硬删孤儿活动的报名脏记录（孤儿key可被猜到ID报名成功）。
 func reconcileOrphans(ctx context.Context) error {
 	var ids []int64
