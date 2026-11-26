@@ -256,6 +256,8 @@ func StartConsumer(callback func(ctx context.Context, msg *SignUpMsg) error) err
 
 // consumeLoop 单消费者主循环：连接断开后自动重建（重连由 watchConnection 负责）
 func consumeLoop(id int, callback func(ctx context.Context, msg *SignUpMsg) error) {
+	// 断线期间只记首次通道创建失败，避免5个消费者×每3秒刷屏；重连失败心跳由 reconnect 日志提供
+	loggedConnErr := false
 	for {
 		select {
 		case <-stopCh:
@@ -271,12 +273,16 @@ func consumeLoop(id int, callback func(ctx context.Context, msg *SignUpMsg) erro
 		}
 		ch, err := c.Channel()
 		if err != nil {
-			logger.L.Errorw("消费者创建通道失败", "consumer", id, "err", err)
+			if !loggedConnErr {
+				loggedConnErr = true
+				logger.L.Errorw("消费者创建通道失败", "consumer", id, "err", err)
+			}
 			if !sleepOrStop(3 * time.Second) {
 				return
 			}
 			continue
 		}
+		loggedConnErr = false
 		// 每通道预取20条；通道死亡时未确认消息由broker重新分发给其他消费者
 		if err := ch.Qos(20, 0, false); err != nil {
 			_ = ch.Close()
