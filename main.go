@@ -28,6 +28,10 @@ func main() {
 	if err := config.Init(); err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	// 启动前校验（必填项缺失直接退出；弱密钥告警）
+	if err := config.Validate(); err != nil {
+		log.Fatalf("配置校验失败: %v", err)
+	}
 	// 结构化日志（依赖配置，故先于其他组件）
 	if err := logger.Init(); err != nil {
 		log.Fatalf("日志初始化失败: %v", err)

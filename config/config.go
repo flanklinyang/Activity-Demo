@@ -1,6 +1,10 @@
 package config
 
 import (
+	"errors"
+	"log"
+	"strings"
+
 	"github.com/spf13/viper"
 )
 
@@ -9,9 +13,10 @@ var Conf AppConfig
 
 type AppConfig struct {
 	Mysql struct {
-		Dsn          string `mapstructure:"dsn"`
-		MaxOpenConns int    `mapstructure:"max_open_conns"`
-		MaxIdleConns int    `mapstructure:"max_idle_conns"`
+		Dsn                   string `mapstructure:"dsn"`
+		MaxOpenConns          int    `mapstructure:"max_open_conns"`
+		MaxIdleConns          int    `mapstructure:"max_idle_conns"`
+		ConnMaxLifetimeSecond int    `mapstructure:"conn_max_lifetime_second"`
 	} `mapstructure:"mysql"`
 	Redis struct {
 		Addr     string `mapstructure:"addr"`
@@ -41,13 +46,34 @@ type AppConfig struct {
 	} `mapstructure:"server"`
 }
 
-// Init 加载yaml配置
+// Init 加载yaml配置，环境变量可覆盖（ACTIVITY_MYSQL_DSN 对应 mysql.dsn）
 func Init() error {
 	viper.SetConfigFile("config.yaml")
-	err := viper.ReadInConfig()
-	if err != nil {
+	if err := viper.ReadInConfig(); err != nil {
 		return err
 	}
-	err = viper.Unmarshal(&Conf)
-	return err
+	viper.SetEnvPrefix("ACTIVITY")
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
+	return viper.Unmarshal(&Conf)
+}
+
+// Validate 启动前校验配置：必填项缺失返回错误；弱JWT密钥仅告警（保持本地演示友好）
+func Validate() error {
+	if Conf.Mysql.Dsn == "" {
+		return errors.New("mysql.dsn 未配置")
+	}
+	if Conf.Redis.Addr == "" {
+		return errors.New("redis.addr 未配置")
+	}
+	if Conf.RabbitMQ.Addr == "" {
+		return errors.New("rabbitmq.addr 未配置")
+	}
+	if Conf.Jwt.Secret == "" {
+		return errors.New("jwt.secret 未配置")
+	}
+	if Conf.Jwt.Secret == "change-me" || len(Conf.Jwt.Secret) < 32 {
+		log.Println("警告: jwt.secret 为默认值或长度不足32，生产环境请更换强密钥")
+	}
+	return nil
 }
