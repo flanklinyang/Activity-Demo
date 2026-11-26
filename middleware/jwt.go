@@ -30,7 +30,7 @@ func JwtAuth() gin.HandlerFunc {
 		claims := &Claims{}
 		token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
 			return []byte(config.Conf.Jwt.Secret), nil
-		})
+		}, jwt.WithValidMethods([]string{"HS256"})) // 限定签名算法，防alg混淆
 		if err != nil || !token.Valid {
 			pkg.Fail(c, 401, "token无效")
 			c.Abort()
