@@ -19,9 +19,12 @@ type AppConfig struct {
 		ConnMaxLifetimeSecond int    `mapstructure:"conn_max_lifetime_second"`
 	} `mapstructure:"mysql"`
 	Redis struct {
-		Addr     string `mapstructure:"addr"`
-		Password string `mapstructure:"password"`
-		DB       int    `mapstructure:"db"`
+		Mode          string   `mapstructure:"mode"` // single（默认）| sentinel
+		Addr          string   `mapstructure:"addr"`
+		Password      string   `mapstructure:"password"`
+		DB            int      `mapstructure:"db"`
+		MasterName    string   `mapstructure:"master_name"`
+		SentinelAddrs []string `mapstructure:"sentinel_addrs"`
 	} `mapstructure:"redis"`
 	RabbitMQ struct {
 		Addr                 string `mapstructure:"addr"`
@@ -63,8 +66,20 @@ func Validate() error {
 	if Conf.Mysql.Dsn == "" {
 		return errors.New("mysql.dsn 未配置")
 	}
-	if Conf.Redis.Addr == "" {
-		return errors.New("redis.addr 未配置")
+	switch Conf.Redis.Mode {
+	case "", "single":
+		if Conf.Redis.Addr == "" {
+			return errors.New("redis.addr 未配置")
+		}
+	case "sentinel":
+		if Conf.Redis.MasterName == "" {
+			return errors.New("redis.master_name 未配置")
+		}
+		if len(Conf.Redis.SentinelAddrs) == 0 {
+			return errors.New("redis.sentinel_addrs 未配置")
+		}
+	default:
+		return errors.New("redis.mode 仅支持 single/sentinel")
 	}
 	if Conf.RabbitMQ.Addr == "" {
 		return errors.New("rabbitmq.addr 未配置")

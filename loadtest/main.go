@@ -39,8 +39,10 @@ var (
 	mqURL     = flag.String("mq-url", "", "RabbitMQ管理API队列地址，如 http://host:15672/api/queues/%2F/activity_signup_queue")
 	mqUser    = flag.String("mq-user", "admin", "RabbitMQ管理API用户名")
 	mqPass    = flag.String("mq-pass", "", "RabbitMQ管理API密码")
-	redisAddr = flag.String("redis-addr", "127.0.0.1:6379", "Redis地址")
-	redisPass = flag.String("redis-pass", "", "Redis密码")
+	redisAddr     = flag.String("redis-addr", "127.0.0.1:6379", "Redis地址")
+	redisPass     = flag.String("redis-pass", "", "Redis密码")
+	redisSentinel = flag.String("redis-sentinel", "", "哨兵地址列表（逗号分隔），提供则一致性校验走FailoverClient跟随当前主")
+	redisMaster   = flag.String("redis-master-name", "mymaster", "哨兵监控的主名")
 )
 
 // 大连接池+keep-alive复用，避免每请求新建TCP连接耗尽客户端端口
@@ -391,7 +393,18 @@ func main() {
 		drainedAt.Sub(t3).Seconds(), time.Since(t3).Seconds(), maxDepth)
 
 	// ---------- 阶段6: 一致性校验 ----------
-	rdb := redis.NewClient(&redis.Options{Addr: *redisAddr, Password: *redisPass, DB: 0})
+	// 提供哨兵地址时走FailoverClient：压测中途主从切换后仍能连上新主完成校验
+	var rdb *redis.Client
+	if *redisSentinel != "" {
+		rdb = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    *redisMaster,
+			SentinelAddrs: strings.Split(*redisSentinel, ","),
+			Password:      *redisPass,
+			DB:            0,
+		})
+	} else {
+		rdb = redis.NewClient(&redis.Options{Addr: *redisAddr, Password: *redisPass, DB: 0})
+	}
 	ctx := context.Background()
 	quota, _ := rdb.Get(ctx, fmt.Sprintf("activity:quota:%d", activityID)).Int64()
 	scard, _ := rdb.SCard(ctx, fmt.Sprintf("activity:sign:%d", activityID)).Result()

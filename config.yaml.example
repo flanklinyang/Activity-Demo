@@ -8,10 +8,18 @@ mysql:
   conn_max_lifetime_second: 3600
 
 # redis
+# mode: single（默认，直连单机）或 sentinel（主从+哨兵，切换时客户端自动跟随新主）
+# sentinel 模式下忽略 addr，使用 master_name + sentinel_addrs
 redis:
+  mode: "single"
   addr: "127.0.0.1:6379"
   password: ""
   db: 0
+  # master_name: "mymaster"
+  # sentinel_addrs:
+  #   - "192.168.100.200:26379"
+  #   - "192.168.100.201:26379"
+  #   - "192.168.100.202:26379"
 
 rabbitmq:
   addr: "127.0.0.1:5672"
